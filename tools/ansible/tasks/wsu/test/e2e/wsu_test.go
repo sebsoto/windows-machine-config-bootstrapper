@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/labels"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/masterzen/winrm"
 	"github.com/openshift/windows-machine-config-operator/tools/windows-node-installer/pkg/cloudprovider"
 	"github.com/openshift/windows-machine-config-operator/tools/windows-node-installer/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/api/certificates/v1beta1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,6 +69,11 @@ var (
 	hybridOverlaySubnet = "k8s.ovn.org/hybrid-overlay-hostsubnet"
 	// hybridOverlayMac is an annotation applied by the hybrid overlay
 	hybridOverlayMac = "k8s.ovn.org/hybrid-overlay-distributed-router-gateway-mac"
+
+	// windowsServerImage is the name/location of the Windows Server 2019 image we will use to test pod deployment
+	windowsServerImage = "mcr.microsoft.com/windows/servercore:ltsc2019"
+	// ubi8Image is the name/location of the linux image we will use for testing
+	ubi8Image = "registry.access.redhat.com/ubi8/ubi:latest"
 )
 
 // createAWSWindowsInstance creates a windows instance and populates the "cloud" and "createdInstanceCreds" global
@@ -160,9 +169,9 @@ func TestWSU(t *testing.T) {
 	require.True(t, len(initialSplit) > 1, "Could not find Windows temp dir: %s", out)
 	ansibleTempDir = "C:\\Users\\Administrator\\AppData\\Local\\Temp\\ansible." + strings.Split(initialSplit[1], "\"")[0]
 
-	// Connect to the bootstrapped host
+	// Connect to the bootstrapped host. Timeout is high as the Windows Server image is slow to download
 	endpoint := winrm.NewEndpoint(createdInstanceCreds.GetIPAddress(), 5986, true, true,
-		nil, nil, nil, 0)
+		nil, nil, nil, time.Minute*10)
 	winRMClient, err = winrm.NewClient(endpoint, "Administrator", createdInstanceCreds.GetPassword())
 	require.NoErrorf(t, err, "Could not create winrm client: %s", err)
 
@@ -173,6 +182,7 @@ func TestWSU(t *testing.T) {
 	t.Run("Check if worker label has been applied to the Windows node", testWorkerLabelsArePresent)
 	t.Run("Network annotations were applied to node", testHybridOverlayAnnotations)
 	t.Run("HNS Networks were created", testHNSNetworksCreated)
+	t.Run("East-west networking", testEastWestNetworking)
 }
 
 // testFilesCopied tests that the files we attempted to copy to the Windows host, exist on the Windows host
@@ -287,4 +297,247 @@ func testHNSNetworksCreated(t *testing.T) {
 		"Could not find BaseOpenShiftNetwork in list of HNS Networks")
 	assert.Contains(t, stdoutString, "Name                   : OpenShiftNetwork",
 		"Could not find OpenShiftNetwork in list of HNS Networks")
+}
+
+// testEastWestNetworking deploys Windows and Linux pods, and tests that the pods can communicate
+func testEastWestNetworking(t *testing.T) {
+	// Preload the image that will be used on the Windows node, to prevent download timeouts
+	// and separate possible failure conditions into multiple operations
+	err := pullDockerImage(windowsServerImage)
+	require.NoError(t, err, "Could not pull Windows Server image")
+
+	// This will run a Server on the container, which can be reached with a GET request
+	winServerCommand := []string{"powershell.exe", "-command",
+		"<#code used from https://gist.github.com/wagnerandrade/5424431#> ; $$listener = " +
+			"New-Object System.Net.HttpListener ; $$listener.Prefixes.Add('http://*:80/') ; " +
+			"$$listener.Start() ; $$callerCounts = @{} ; Write-Host('Listening at http://*:80/')" +
+			" ; while ($$listener.IsListening) { ;$$context = $$listener.GetContext() ;" +
+			"$$requestUrl = $$context.Request.Url ;$$clientIP = " +
+			"$$context.Request.RemoteEndPoint.Address ;$$response = $$context.Response ;" +
+			"Write-Host '' ;Write-Host('> {0}' -f $$requestUrl) ;  ;$$count = 1 ;" +
+			"$$k=$$callerCounts.Get_Item($$clientIP) ;if ($$k -ne $$null) { $$count += $$k } ;" +
+			"$$callerCounts.Set_Item($$clientIP, $$count) ;$$ip=(Get-NetAdapter | " +
+			"Get-NetIpAddress); $$header='<html><body><H1>Windows Container Web Server</H1>' " +
+			";$$callerCountsString='' ;$$callerCounts.Keys | % { $$callerCountsString+='<p>IP {0}" +
+			" callerCount {1} ' -f $$ip[1].IPAddress,$$callerCounts.Item($$_) } " +
+			";$$footer='</body></html>' ;$$content='{0}{1}{2}' -f " +
+			"$$header,$$callerCountsString,$$footer ;Write-Output $$content ;$$buffer = " +
+			"[System.Text.Encoding]::UTF8.GetBytes($$content) ;$$response.ContentLength64 = " +
+			"$$buffer.Length ;$$response.OutputStream.Write($$buffer, 0, $$buffer.Length) ;" +
+			"$$response.Close() ;$$responseStatus = $$response.StatusCode ;" +
+			"Write-Host('< {0}' -f $$responseStatus)  } ; "}
+	winServerDeployment, err := createWindowsServerDeployment("win-server", winServerCommand)
+	require.NoError(t, err, "Could not create Windows deployment")
+	defer deleteDeployment(winServerDeployment.Name)
+	// Wait until the server is ready to be queried
+	winServerPod, err := waitUntilPodHasRunningContainer(*winServerDeployment.Spec.Selector)
+	require.NoError(t, err, "Could not retrieve pod with selector %v", *winServerDeployment.Spec.Selector)
+
+	// test Windows <-> Linux
+	// This will install curl and then curl the windows server.
+	linuxCurlerCommand := []string{"bash", "-c", "yum update; yum install curl -y; curl " + winServerPod.Status.PodIP}
+	linuxCurlerJob, err := createLinuxJob("linux-curler", linuxCurlerCommand)
+	require.NoError(t, err, "Could not create Linux job")
+	defer deleteJob(linuxCurlerJob.Name)
+	err = waitUntilJobSucceeds(linuxCurlerJob.Name)
+	assert.NoError(t, err, "Could not curl the Windows server from a linux container")
+
+	// test Windows <-> Windows on same node
+	// This will continually try to read from the Windows Server. We have to try multiple times as the network is flaky
+	// on container startup
+	winCurlerCommand := []string{"powershell.exe", "-command", "for (($i =0), ($j = 0); $i -lt 10; $i++) { " +
+		"$response = Invoke-Webrequest -UseBasicParsing -Uri " + winServerPod.Status.PodIP +
+		"; $code = $response.StatusCode; echo \"GET returned code $code\";" +
+		"If ($code -eq 200) {exit 0}; Start-Sleep -s 10;}; exit 1" + winServerPod.Status.PodIP}
+	winCurlerJob, err := createWindowsServerJob("win-curler", winCurlerCommand)
+	require.NoError(t, err, "Could not create Windows job")
+	defer deleteJob(winCurlerJob.Name)
+	err = waitUntilJobSucceeds(winCurlerJob.Name)
+	assert.NoError(t, err, "Could not curl the Windows server from a Windows container")
+
+	// TODO: test Windows <-> Windows on different node
+}
+
+// waitUntilJobSucceeds will return an error if the job fails or reaches a timeout
+func waitUntilJobSucceeds(name string) error {
+	var job *batchv1.Job
+	var err error
+	for i := 0; i < 10; i++ {
+		job, err = k8sclientset.BatchV1().Jobs(v1.NamespaceDefault).Get(name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if job.Status.Succeeded > 0 {
+			return nil
+		}
+		if job.Status.Failed > 0 {
+			return fmt.Errorf("job %v failed", job)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("job %v timed out", job)
+}
+
+// waitUntilPodHasRunningContainer will return a pod that matches the selector, once the container specified by the pod
+// is in the "Running" state
+func waitUntilPodHasRunningContainer(selector metav1.LabelSelector) (v1.Pod, error) {
+	var err error
+	pod := v1.Pod{}
+	for i := 0; i < 10; i++ {
+		pod, err = getPodWithLabelSelector(selector)
+		if err != nil {
+			return v1.Pod{}, err
+		}
+		if len(pod.Status.ContainerStatuses) > 1 {
+			return v1.Pod{}, fmt.Errorf("expected one container within the pod but found %d",
+				len(pod.Status.ContainerStatuses))
+		} else if len(pod.Status.ContainerStatuses) == 1 {
+			container := pod.Status.ContainerStatuses[0]
+			if container.State.Running != nil {
+				return pod, nil
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return pod, fmt.Errorf("timed out waiting for pod %v to have ready container", pod)
+}
+
+// getPodWithLabelSelector returns the pod that matches the label selector. If more than one pod match the selector,
+// the function will return an error
+func getPodWithLabelSelector(selector metav1.LabelSelector) (v1.Pod, error) {
+	selectorString := labels.Set(selector.MatchLabels).String()
+	podList, err := k8sclientset.CoreV1().Pods(v1.NamespaceDefault).List(metav1.ListOptions{LabelSelector: selectorString})
+	if err != nil {
+		return v1.Pod{}, err
+	}
+	if len(podList.Items) != 1 {
+		return v1.Pod{}, fmt.Errorf("expected one pod matching %s, but found %d", selectorString, len(podList.Items))
+	}
+
+	return podList.Items[0], nil
+}
+
+// createWindowsServerJob creates a job which will run the provided command with a Windows Server image
+func createWindowsServerJob(name string, command []string) (*batchv1.Job, error) {
+	windowsNodeSelector := map[string]string{"beta.kubernetes.io/os": "windows"}
+	windowsTolerations := []v1.Toleration{{Key: "os", Value: "Windows", Effect: v1.TaintEffectNoSchedule}}
+	return createJob(name, windowsServerImage, command, windowsNodeSelector, windowsTolerations)
+}
+
+// createLinuxJob creates a job which will run the provided command with a ubi8 image
+func createLinuxJob(name string, command []string) (*batchv1.Job, error) {
+	return createJob(name, ubi8Image, command, map[string]string{}, []v1.Toleration{})
+}
+
+func createJob(name, image string, command []string, selector map[string]string, tolerations []v1.Toleration) (*batchv1.Job, error) {
+	jobsClient := k8sclientset.BatchV1().Jobs(v1.NamespaceDefault)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name + "-job",
+		},
+		Spec: batchv1.JobSpec{
+			Template: v1.PodTemplateSpec{
+				Spec: v1.PodSpec{
+					RestartPolicy: v1.RestartPolicyNever,
+					Tolerations:   tolerations,
+					Containers: []v1.Container{
+						{
+							Name:            name,
+							Image:           image,
+							ImagePullPolicy: v1.PullIfNotPresent,
+							Command:         command,
+						},
+					},
+					NodeSelector: selector,
+				},
+			},
+		},
+	}
+
+	// Create job
+	job, err := jobsClient.Create(job)
+	if err != nil {
+		return nil, err
+	}
+	return job, err
+}
+
+// deleteJob deletes the job with the given name
+func deleteJob(name string) error {
+	jobsClient := k8sclientset.BatchV1().Jobs(v1.NamespaceDefault)
+	return jobsClient.Delete(name, &metav1.DeleteOptions{})
+}
+
+// createWindowsServerDeployment creates a deployment with a Windows Server 2019 container
+func createWindowsServerDeployment(name string, command []string) (*appsv1.Deployment, error) {
+	deploymentsClient := k8sclientset.AppsV1().Deployments(v1.NamespaceDefault)
+	replicaCount := int32(1)
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name + "-deployment",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicaCount,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": name,
+				},
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": name,
+					},
+				},
+				Spec: v1.PodSpec{
+					Tolerations: []v1.Toleration{
+						{
+							Key:    "os",
+							Value:  "Windows",
+							Effect: v1.TaintEffectNoSchedule,
+						},
+					},
+					Containers: []v1.Container{
+						// Windows web server
+						{
+							Name:            name,
+							Image:           windowsServerImage,
+							ImagePullPolicy: v1.PullIfNotPresent,
+							Command:         command,
+						},
+					},
+					NodeSelector: map[string]string{"beta.kubernetes.io/os": "windows"},
+				},
+			},
+		},
+	}
+
+	// Create Deployment
+	deploy, err := deploymentsClient.Create(deployment)
+	if err != nil {
+		return nil, err
+	}
+	return deploy, err
+}
+
+// deleteDeployment deletes the deployment with the given name
+func deleteDeployment(name string) error {
+	deploymentsClient := k8sclientset.AppsV1().Deployments(v1.NamespaceDefault)
+	return deploymentsClient.Delete(name, &metav1.DeleteOptions{})
+}
+
+// pullDockerImage pulls the designated image on the remote host
+func pullDockerImage(name string) error {
+	stdout := new(bytes.Buffer)
+	stderr := new(bytes.Buffer)
+	command := "docker pull " + name
+	errorCode, err := winRMClient.Run(command, stdout, stderr)
+	if err != nil {
+		return fmt.Errorf("failed to remotely run docker pull: %s", err)
+	}
+	stderrString := stdout.String()
+	if errorCode != 0 {
+		return fmt.Errorf("return code %d, stderr: %s", errorCode, stderrString)
+	}
+	return nil
 }
