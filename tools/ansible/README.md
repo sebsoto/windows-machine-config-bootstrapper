@@ -48,3 +48,9 @@ Run the WSU playbook:
 ```
 $ ansible-playbook -i hosts tasks/wsu/main.yaml -v
 ```
+
+A specific WMCB version can be used by specifying its URL in the host file
+```
+[win]
+<node_ip> ansible_password=<password> wmcb_url=<location of wmcb.exe>
+```
