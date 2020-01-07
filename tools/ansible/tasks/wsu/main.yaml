@@ -70,6 +70,11 @@
       win_tempfile:
         state: directory
       register: win_temp_dir
+
+    - name: Display Windows temporary directory
+      debug:
+        msg: "Windows temporary directory: {{ win_temp_dir.path }}"
+
     - name: Copy required files to Windows host
       win_copy:
         src: "{{ hostvars['localhost']['tmp_dir']['path'] }}/"

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	e2ef "github.com/openshift/windows-machine-config-operator/internal/test/framework"
-	"github.com/openshift/windows-machine-config-operator/tools/windows-node-installer/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -40,8 +39,6 @@ var (
 		"a9659d14b79cc46e2067f6b13e6df3f3f1b0f64"
 	// workerLabel is the worker label that needs to be applied to the Windows node
 	workerLabel = "node-role.kubernetes.io/worker"
-	// windowsLabel represents the node label that need to be applied to the Windows node created
-	windowsLabel = "node.openshift.io/os_id=Windows"
 	// hybridOverlaySubnet is an annotation applied by the cluster network operator which is used by the hybrid overlay
 	hybridOverlaySubnet = "k8s.ovn.org/hybrid-overlay-node-subnet"
 	// hybridOverlayMac is an annotation applied by the hybrid overlay
@@ -58,6 +55,8 @@ var (
 	retryInterval = 5 * time.Second
 	// wmcbReleasesURL is the url of the wmcb releases through the github api endpoint
 	wmcbReleasesURL = "https://api.github.com/repos/openshift/windows-machine-config-operator/releases"
+	//wmcbExeRegex searches for the path of the WMCB exe
+	wmcbExeRegex = regexp.MustCompile(`\/tmp\S*\/wmcb\.exe`)
 )
 
 // getLatestReleasedArtifactURL returns the URL of the latest releases artifact containing the given name
@@ -98,7 +97,7 @@ func getLatestReleasedArtifactURL(artifactName string) (string, error) {
 }
 
 // createhostFile creates an ansible host file for the VMs we have spun up
-func createHostFile() (string, error) {
+func createHostFile(vmList []e2ef.WindowsVM) (string, error) {
 	hostFile, err := ioutil.TempFile("", "testWSU")
 	if err != nil {
 		return "", fmt.Errorf("coud not make temporary file: %s", err)
@@ -107,19 +106,8 @@ func createHostFile() (string, error) {
 
 	// Add each host to the host file
 	hostFileContents := "[win]\n"
-
-	// The first VM will use the pinned WMCB version
-	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
-	if err != nil {
-		return "", err
-	}
-	creds := framework.WinVMs[0].GetCredentials()
-	hostFileContents += creds.GetIPAddress() + " " + "ansible_password='" + creds.GetPassword() + "'" + " " +
-		"wmcb_url=" + wmcbPinnedURL + "\n"
-
-	// The rest will use the default options
-	for i := 1; i < len(framework.WinVMs); i++ {
-		creds = framework.WinVMs[i].GetCredentials()
+	for i := 0; i < len(vmList); i++ {
+		creds := vmList[i].GetCredentials()
 		hostFileContents += creds.GetIPAddress() + " " + "ansible_password='" + creds.GetPassword() + "'" + "\n"
 	}
 
@@ -135,25 +123,18 @@ ansible_winrm_server_cert_validation=ignore
 	return hostFile.Name(), err
 }
 
-// TestPinnedWMCB tests that we can use a pinned version of the WMCB, instead of building it at runtime
-func TestPinnedWMCB(t *testing.T) {
+// testPinnedWMCB tests that we can use a pinned version of the WMCB, instead of building it at runtime
+func testPinnedWMCB(t *testing.T, ansibleOutput string) {
 	require.NotEmptyf(t, playbookPath, "WSU_PATH environment variable not set")
 
-	wmcbRegex, err := regexp.Compile(`\/tmp\S*exe`)
-	require.NoError(t, err, "Could not compile wmcb path regex")
-
-	// Run playbook with pinned version option
+	// Get URL of last released wmcb
 	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
 	require.NoError(t, err, "Could not get WMCB url")
-	wmcbPinnedURLVariable := "wmcb_url=" + wmcbPinnedURL
-	cmd := exec.Command("ansible-playbook", "-v", "-e", wmcbPinnedURLVariable, playbookPath)
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
 
 	// Check that we used the pinned version
-	require.Contains(t, string(out), wmcbPinnedURL, "Pinned version was not used in WSU")
+	require.Contains(t, ansibleOutput, wmcbPinnedURL, "Pinned version was not used in WSU")
 
-	// Check that the sha is correct
+	// Download the wmcb.exe and check the SHA
 	resp, err := http.Get(wmcbPinnedURL)
 	require.NoErrorf(t, err, "Could not download wmcb.exe from %s", wmcbPinnedURL)
 	defer resp.Body.Close()
@@ -162,19 +143,17 @@ func TestPinnedWMCB(t *testing.T) {
 	require.NoError(t, err)
 	wmcbPinnedURLSha256 := sha256.Sum256(body)
 
-	wmcbPath := wmcbRegex.FindString(string(out))
+	// Ensure the WSU used the correct WMCB via SHA256
+	wmcbPath := wmcbExeRegex.FindString(ansibleOutput)
 	require.NotEmpty(t, wmcbPath)
 	wmcbContents, err := ioutil.ReadFile(wmcbPath)
 	downloadedWMCBSha := sha256.Sum256(wmcbContents)
 	assert.Equal(t, wmcbPinnedURLSha256, downloadedWMCBSha, "Downloaded WMCB has different SHA256 than expected")
+}
 
-	// Run the playbook without the pinned version option
-	cmd = exec.Command("ansible-playbook", "-v", playbookPath)
-	out, err = cmd.CombinedOutput()
-	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
-
-	// Test that we built the wmcb
-	require.Contains(t, string(out),
+// testBuiltWMCB tests that the WMCB was built, and not downloaded
+func testBuiltWMCB(t *testing.T, ansibleOutput string) {
+	require.Contains(t, ansibleOutput,
 		"CGO_ENABLED=0 GO111MODULE=on GOOS=windows go build -o wmcb.exe  "+
 			"github.com/openshift/windows-machine-config-operator/cmd/bootstrapper")
 }
@@ -188,94 +167,95 @@ func TestWSU(t *testing.T) {
 
 	require.GreaterOrEqual(t, vmCount, 1, "Expected one or more VMs")
 
-	// In order to run the ansible playbook we create an inventory file:
-	// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
-	hostFilePath, err := createHostFile()
-	require.NoErrorf(t, err, "Could not write to host file: %s", err)
-
-	// Run the playbook
-	cmd := exec.Command("ansible-playbook", "-v", "-i", hostFilePath, playbookPath)
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
-
-	// Run cluster wide tests
-	t.Run("Pending CSRs were approved", testNoPendingCSRs)
+	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
+	require.NoError(t, err, "Could not get WMCB url")
+	pinnedWMCBOption := "wmcb_url=" + wmcbPinnedURL
 
 	// Run VM specific tests
 	for i, vm := range framework.WinVMs {
-		func(vm e2ef.WindowsVM) {
+		func(vmNum int, vm e2ef.WindowsVM) {
 			t.Run("VM "+strconv.Itoa(i), func(t *testing.T) {
 				// Indicate that we can run the test suite on each node in parallel
 				t.Parallel()
-				runVMTestSuite(t, vm)
+
+				// In order to run the ansible playbook we create an inventory file:
+				// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
+				// Passing in a slice with a single entry for now
+				hostFilePath, err := createHostFile([]e2ef.WindowsVM{framework.WinVMs[vmNum]})
+				require.NoErrorf(t, err, "Could not write to host file: %s", err)
+
+				// Run the playbook
+				// For the first VM we use a pinned WMCB version
+				var ansibleCmd *exec.Cmd
+				var pinnedWMCB bool
+				if vmNum == 0 {
+					pinnedWMCB = true
+					ansibleCmd = exec.Command("ansible-playbook", "-v", "-e", pinnedWMCBOption, "-i",
+						hostFilePath, playbookPath)
+				} else {
+					ansibleCmd = exec.Command("ansible-playbook", "-v", "-i", hostFilePath, playbookPath)
+				}
+				out, err := ansibleCmd.CombinedOutput()
+				require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
+				runE2ETestSuite(t, pinnedWMCB, vm, string(out))
+
 				// Run the test suite twice, to ensure that the WSU can be run multiple times against the same VM
 				t.Run("Run the WSU against the same VM again", func(t *testing.T) {
-					runVMTestSuite(t, vm)
+					runE2ETestSuite(t, pinnedWMCB, vm, string(out))
 				})
 			})
-		}(vm)
+		}(i, vm)
 	}
+
+	// Run cluster wide tests
+	t.Run("Pending CSRs were approved", testNoPendingCSRs)
 }
 
 // getAnsibleTempDirPath returns the path of the ansible temp directory on the remote VM
-func getAnsibleTempDirPath(vm e2ef.WindowsVM) (string, error) {
-	var ansibleTempDir string
-	var nameIndex int
-	ansibleTempDirBase := "C:\\Users\\Administrator\\AppData\\Local\\Temp\\"
-	ansibleTempDirPrefix := "ansible."
-
-	// Windows ls has output format of:
-	// Mode                LastWriteTime         Length Name
-	// ----                -------------         ------ ----
-	// d-----        5/15/2019   8:39 PM                Microsoft
-	// d-----        5/15/2019   8:39 PM                Packages
-	stdout, _, err := vm.Run("ls "+ansibleTempDirBase, true)
-	if err != nil {
-		return "", err
+func getAnsibleTempDirPath(ansibleOutput string) (string, error) {
+	// Debug line looks like:
+	// "msg": "Windows temporary directory: C:\\Users\\Administrator\\AppData\\Local\\Temp\\ansible.to4wamvh.yzk"
+	debugStatementSplit := strings.Split(ansibleOutput, "Windows temporary directory: ")
+	if len(debugStatementSplit) != 2 {
+		return "", fmt.Errorf("expected one temporary directory debug statement, but found multiple: %s", ansibleOutput)
+	}
+	tempDirSplit := strings.Split(debugStatementSplit[1], "\"")
+	if len(tempDirSplit) < 2 {
+		return "", fmt.Errorf("unexpected split format %s", ansibleOutput)
 	}
 
-	// We should only expect one Ansible temp directory
-	if strings.Count(stdout, ansibleTempDirPrefix) != 1 {
-		return "", fmt.Errorf("single ansible temp dir not found in ls output: %s", stdout)
-	}
-	lines := strings.Split(stdout, "\r\n")
-
-	// Get start of "Name" column
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Mode") {
-			nameIndex = strings.Index(line, "Name")
-			break
-		}
-	}
-
-	// Go through the file list and find the ansible directory
-	for _, line := range lines {
-		if strings.Contains(line, ansibleTempDirPrefix) {
-			// Need to get rid of trailing spaces
-			ansibleTempDir = ansibleTempDirBase + strings.TrimRight(line[nameIndex:], " ")
-			break
-		}
-	}
-
-	return ansibleTempDir, nil
+	return tempDirSplit[0], nil
 }
 
-// runVMTestSuite runs the WSU test suite against a VM
-func runVMTestSuite(t *testing.T, vm e2ef.WindowsVM) {
-	tempDirPath, err := getAnsibleTempDirPath(vm)
+// runE2ETestSuite runs the WSU test suite against a VM
+func runE2ETestSuite(t *testing.T, pinnedWMCB bool, vm e2ef.WindowsVM, ansibleOutput string) {
+	tempDirPath, err := getAnsibleTempDirPath(ansibleOutput)
 	require.NoError(t, err, "Could not get path of Ansible temp directory")
+
+	if pinnedWMCB {
+		t.Run("Using pinned version of WMCB", func(t *testing.T) {
+			testPinnedWMCB(t, ansibleOutput)
+		})
+	} else {
+		t.Run("Built WMCB", func(t *testing.T) {
+			testBuiltWMCB(t, ansibleOutput)
+		})
+	}
+
+	node, err := getNode(vm.GetCredentials().GetIPAddress())
+	require.NoError(t, err, "Could not get Windows node object")
 
 	t.Run("Files copied to Windows node", func(t *testing.T) {
 		testFilesCopied(t, vm, tempDirPath)
 	})
 	t.Run("Node is in ready state", func(t *testing.T) {
-		testNodeReady(t, vm.GetCredentials())
+		testNodeReady(t, node)
 	})
 	t.Run("Check if worker label has been applied to the Windows node", func(t *testing.T) {
-		testWorkerLabelsArePresent(t, vm)
+		testWorkerLabelsArePresent(t, node)
 	})
 	t.Run("Network annotations were applied to node", func(t *testing.T) {
-		testHybridOverlayAnnotations(t, vm)
+		testHybridOverlayAnnotations(t, node)
 	})
 	t.Run("HNS Networks were created", func(t *testing.T) {
 		testHNSNetworksCreated(t, vm)
@@ -378,10 +358,7 @@ func getNode(externalIP string) (*v1.Node, error) {
 }
 
 // testNodeReady tests that the bootstrapped node was added to the cluster and is in the ready state
-func testNodeReady(t *testing.T, vmCredentials *types.Credentials) {
-	createdNode, err := getNode(vmCredentials.GetIPAddress())
-	require.NoError(t, err, "Could not get node associated with VM")
-
+func testNodeReady(t *testing.T, createdNode *v1.Node) {
 	// Make sure the node is in a ready state
 	foundReady := false
 	for _, condition := range createdNode.Status.Conditions {
@@ -411,9 +388,7 @@ func testNoPendingCSRs(t *testing.T) {
 }
 
 // testWorkerLabelsArePresent tests if the worker labels are present on the Windows Node.
-func testWorkerLabelsArePresent(t *testing.T, vm e2ef.WindowsVM) {
-	node, err := getNode(vm.GetCredentials().GetIPAddress())
-	require.NoError(t, err, "Could not get Windows node object")
+func testWorkerLabelsArePresent(t *testing.T, node *v1.Node) {
 	assert.Contains(t, node.Labels, workerLabel,
 		"expected worker label to be present on the Windows node but did not find any")
 }
@@ -428,9 +403,7 @@ func readRemoteFile(fileName string, vm e2ef.WindowsVM) (string, error) {
 }
 
 // testHybridOverlayAnnotations tests that the correct annotations have been added to the bootstrapped node
-func testHybridOverlayAnnotations(t *testing.T, vm e2ef.WindowsVM) {
-	node, err := getNode(vm.GetCredentials().GetIPAddress())
-	require.NoError(t, err, "Could not get Windows node object")
+func testHybridOverlayAnnotations(t *testing.T, node *v1.Node) {
 	assert.Contains(t, node.Annotations, hybridOverlaySubnet)
 	assert.Contains(t, node.Annotations, hybridOverlayMac)
 }
