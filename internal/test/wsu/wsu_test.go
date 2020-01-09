@@ -164,51 +164,71 @@ func testBuiltWMCB(t *testing.T, ansibleOutput string) {
 func TestWSU(t *testing.T) {
 	require.NotEmptyf(t, playbookPath, "WSU_PATH environment variable not set")
 	require.NotEmptyf(t, clusterAddress, "CLUSTER_ADDR environment variable not set")
-
 	require.GreaterOrEqual(t, vmCount, 1, "Expected one or more VMs")
 
 	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
 	require.NoError(t, err, "Could not get WMCB url")
-	pinnedWMCBOption := "wmcb_url=" + wmcbPinnedURL
 
 	// Run VM specific tests
 	for i, vm := range framework.WinVMs {
-		func(vmNum int, vm e2ef.WindowsVM) {
-			t.Run("VM "+strconv.Itoa(i), func(t *testing.T) {
-				// Indicate that we can run the test suite on each node in parallel
-				t.Parallel()
-
-				// In order to run the ansible playbook we create an inventory file:
-				// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
-				// Passing in a slice with a single entry for now
-				hostFilePath, err := createHostFile([]e2ef.WindowsVM{framework.WinVMs[vmNum]})
-				require.NoErrorf(t, err, "Could not write to host file: %s", err)
-
-				// Run the playbook
-				// For the first VM we use a pinned WMCB version
-				var ansibleCmd *exec.Cmd
-				var pinnedWMCB bool
-				if vmNum == 0 {
-					pinnedWMCB = true
-					ansibleCmd = exec.Command("ansible-playbook", "-v", "-e", pinnedWMCBOption, "-i",
-						hostFilePath, playbookPath)
-				} else {
-					ansibleCmd = exec.Command("ansible-playbook", "-v", "-i", hostFilePath, playbookPath)
-				}
-				out, err := ansibleCmd.CombinedOutput()
-				require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
-				runE2ETestSuite(t, pinnedWMCB, vm, string(out))
-
-				// Run the test suite twice, to ensure that the WSU can be run multiple times against the same VM
-				t.Run("Run the WSU against the same VM again", func(t *testing.T) {
-					runE2ETestSuite(t, pinnedWMCB, vm, string(out))
-				})
-			})
-		}(i, vm)
+		t.Run("VM "+strconv.Itoa(i), func(t *testing.T) {
+			testVM(t, i, vm, wmcbPinnedURL)
+		})
 	}
 
 	// Run cluster wide tests
 	t.Run("Pending CSRs were approved", testNoPendingCSRs)
+}
+
+// testVM runs the WSU against the given VM and runs the e2e test suite against that VM as well
+func testVM(t *testing.T, vmNum int, vm e2ef.WindowsVM, wmcbURL string) {
+	var wsuOut string
+	var pinnedWMCB bool
+	var err error
+	pinnedWMCBOption := "wmcb_url=" + wmcbURL
+
+	// Indicate that we can run the test suite on each node in parallel
+	t.Parallel()
+
+	// Run the WSU against the VM
+	if vmNum == 0 {
+		// For the first VM we use a pinned WMCB version
+		wsuOut, err = runWSUAgainstVM(vm, pinnedWMCBOption)
+		pinnedWMCB = true
+	} else {
+		wsuOut, err = runWSUAgainstVM(vm, "")
+	}
+	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, wsuOut)
+
+	// Run the test suite
+	runE2ETestSuite(t, pinnedWMCB, vm, wsuOut)
+
+	// Run the test suite twice, to ensure that the WSU can be run multiple times against the same VM
+	t.Run("Run the WSU against the same VM again", func(t *testing.T) {
+		runE2ETestSuite(t, pinnedWMCB, vm, wsuOut)
+	})
+}
+
+// runWSUAgainstVM runs the WSU against a VM and returns the playbook stdout
+func runWSUAgainstVM(vm e2ef.WindowsVM, extraVars string) (string, error) {
+	// In order to run the ansible playbook we create an inventory file:
+	// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
+	hostFilePath, err := createHostFile([]e2ef.WindowsVM{vm})
+	if err != nil {
+		return "", err
+	}
+
+	var ansibleCmd *exec.Cmd
+	if extraVars != "" {
+		ansibleCmd = exec.Command("ansible-playbook", "-v", "-e", extraVars, "-i",
+			hostFilePath, playbookPath)
+	} else {
+		ansibleCmd = exec.Command("ansible-playbook", "-v", "-i", hostFilePath, playbookPath)
+	}
+
+	// Run the playbook
+	out, err := ansibleCmd.CombinedOutput()
+	return string(out), err
 }
 
 // getAnsibleTempDirPath returns the path of the ansible temp directory on the remote VM
@@ -515,7 +535,9 @@ func deployWindowsWebServer(name string, vm e2ef.WindowsVM, affinity *v1.Affinit
 func waitUntilJobSucceeds(name string) error {
 	var job *batchv1.Job
 	var err error
-	for i := 0; i < retryCount; i++ {
+	// Doubling the retry count as the test has been flaking due to errors seen here:
+	// https://bugzilla.redhat.com/show_bug.cgi?id=1781297
+	for i := 0; i < 2*retryCount; i++ {
 		job, err = framework.K8sclientset.BatchV1().Jobs(v1.NamespaceDefault).Get(name, metav1.GetOptions{})
 		if err != nil {
 			return err
