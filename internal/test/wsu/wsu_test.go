@@ -57,6 +57,9 @@ var (
 	wmcbReleasesURL = "https://api.github.com/repos/openshift/windows-machine-config-operator/releases"
 	//wmcbExeRegex searches for the path of the WMCB exe
 	wmcbExeRegex = regexp.MustCompile(`\/tmp\S*\/wmcb\.exe`)
+
+	// pinnedWMCBVM indicates which VM will use a pinned wmcb version
+	pinnedWMCBVM = 1
 )
 
 // getLatestReleasedArtifactURL returns the URL of the latest releases artifact containing the given name
@@ -67,7 +70,7 @@ func getLatestReleasedArtifactURL(artifactName string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github api returned non OK status code: %v", resp)
+		return "", fmt.Errorf("recieved non OK status code: %v", resp)
 	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -123,31 +126,51 @@ ansible_winrm_server_cert_validation=ignore
 	return hostFile.Name(), err
 }
 
+// hashRemoteFile returns the hash of a file located at the given URL
+func hashRemoteFile(fileURL string) ([sha256.Size]byte, error) {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("could not download file from %s", fileURL)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return [sha256.Size]byte{}, fmt.Errorf("github api returned non OK status code: %v", resp)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("could not read response body")
+	}
+	return sha256.Sum256(body), nil
+}
+
+// hashDownloadedWMCB returns the hash of the wmcb.exe which was downloaded during the run of the WSU
+func hashDownloadedWMCB(ansibleOutput string) ([sha256.Size]byte, error) {
+	wmcbPath := wmcbExeRegex.FindString(ansibleOutput)
+	if wmcbPath == "" {
+		return [sha256.Size]byte{}, fmt.Errorf("could not find a reference to downloaded wmcb in ansible output")
+	}
+	wmcbContents, err := ioutil.ReadFile(wmcbPath)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("could not read wmcb")
+	}
+	return sha256.Sum256(wmcbContents), nil
+}
+
 // testPinnedWMCB tests that we can use a pinned version of the WMCB, instead of building it at runtime
-func testPinnedWMCB(t *testing.T, ansibleOutput string) {
-	require.NotEmptyf(t, playbookPath, "WSU_PATH environment variable not set")
-
-	// Get URL of last released wmcb
-	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
-	require.NoError(t, err, "Could not get WMCB url")
-
+func testPinnedWMCB(t *testing.T, ansibleOutput string, wmcbPinnedURL string) {
 	// Check that we used the pinned version
 	require.Contains(t, ansibleOutput, wmcbPinnedURL, "Pinned version was not used in WSU")
 
 	// Download the wmcb.exe and check the SHA
-	resp, err := http.Get(wmcbPinnedURL)
-	require.NoErrorf(t, err, "Could not download wmcb.exe from %s", wmcbPinnedURL)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode, "github api returned non OK status code: %v", resp)
-	body, err := ioutil.ReadAll(resp.Body)
-	require.NoError(t, err)
-	wmcbPinnedURLSha256 := sha256.Sum256(body)
+	wmcbPinnedURLSha256, err := hashRemoteFile(wmcbPinnedURL)
+	require.NoError(t, err, "Could not get hash of pinned wmcb")
+
+	// Hash the wmcb WSU used
+	downloadedWMCBSha, err := hashDownloadedWMCB(ansibleOutput)
+	require.NoError(t, err, "Could not get hash of downloaded wmcb")
 
 	// Ensure the WSU used the correct WMCB via SHA256
-	wmcbPath := wmcbExeRegex.FindString(ansibleOutput)
-	require.NotEmpty(t, wmcbPath)
-	wmcbContents, err := ioutil.ReadFile(wmcbPath)
-	downloadedWMCBSha := sha256.Sum256(wmcbContents)
 	assert.Equal(t, wmcbPinnedURLSha256, downloadedWMCBSha, "Downloaded WMCB has different SHA256 than expected")
 }
 
@@ -164,15 +187,25 @@ func testBuiltWMCB(t *testing.T, ansibleOutput string) {
 func TestWSU(t *testing.T) {
 	require.NotEmptyf(t, playbookPath, "WSU_PATH environment variable not set")
 	require.NotEmptyf(t, clusterAddress, "CLUSTER_ADDR environment variable not set")
-	require.GreaterOrEqual(t, vmCount, 1, "Expected one or more VMs")
 
 	wmcbPinnedURL, err := getLatestReleasedArtifactURL("wmcb.exe")
 	require.NoError(t, err, "Could not get WMCB url")
 
 	// Run VM specific tests
-	for i, vm := range framework.WinVMs {
+	for i, _ := range framework.WinVMs {
 		t.Run("VM "+strconv.Itoa(i), func(t *testing.T) {
-			testVM(t, i, vm, wmcbPinnedURL)
+			// We have to keep track of i before t.Parallel() is called, or we'll end up using the last VM for each
+			// test
+			vmNum := i
+			// Indicate that we can run the test suite on each node in parallel
+			t.Parallel()
+
+			// Run the WSU against the VM
+			wsuOut, pinnedWMCB, err := runWSU(i, framework.WinVMs[vmNum], wmcbPinnedURL)
+			require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, wsuOut)
+
+			// Run our VM test suite
+			runTest(t, pinnedWMCB, framework.WinVMs[vmNum], wsuOut, wmcbPinnedURL)
 		})
 	}
 
@@ -180,55 +213,42 @@ func TestWSU(t *testing.T) {
 	t.Run("Pending CSRs were approved", testNoPendingCSRs)
 }
 
-// testVM runs the WSU against the given VM and runs the e2e test suite against that VM as well
-func testVM(t *testing.T, vmNum int, vm e2ef.WindowsVM, wmcbURL string) {
-	var wsuOut string
-	var pinnedWMCB bool
-	var err error
+// runWSU runs the WSU playbook against a VM. Returns WSU stdout and whether it used a pinned WMCB
+func runWSU(vmNum int, vm e2ef.WindowsVM, wmcbURL string) (string, bool, error) {
+	var usedPinned bool
+	var ansibleCmd *exec.Cmd
 	pinnedWMCBOption := "wmcb_url=" + wmcbURL
 
-	// Indicate that we can run the test suite on each node in parallel
-	t.Parallel()
-
-	// Run the WSU against the VM
-	if vmNum == 0 {
-		// For the first VM we use a pinned WMCB version
-		wsuOut, err = runWSUAgainstVM(vm, pinnedWMCBOption)
-		pinnedWMCB = true
-	} else {
-		wsuOut, err = runWSUAgainstVM(vm, "")
-	}
-	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, wsuOut)
-
-	// Run the test suite
-	runE2ETestSuite(t, pinnedWMCB, vm, wsuOut)
-
-	// Run the test suite twice, to ensure that the WSU can be run multiple times against the same VM
-	t.Run("Run the WSU against the same VM again", func(t *testing.T) {
-		runE2ETestSuite(t, pinnedWMCB, vm, wsuOut)
-	})
-}
-
-// runWSUAgainstVM runs the WSU against a VM and returns the playbook stdout
-func runWSUAgainstVM(vm e2ef.WindowsVM, extraVars string) (string, error) {
 	// In order to run the ansible playbook we create an inventory file:
 	// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
 	hostFilePath, err := createHostFile([]e2ef.WindowsVM{vm})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	var ansibleCmd *exec.Cmd
-	if extraVars != "" {
-		ansibleCmd = exec.Command("ansible-playbook", "-v", "-e", extraVars, "-i",
+	// Run the WSU against the VM
+	if vmNum == pinnedWMCBVM {
+		usedPinned = true
+		ansibleCmd = exec.Command("ansible-playbook", "-v", "-e", pinnedWMCBOption, "-i",
 			hostFilePath, playbookPath)
 	} else {
 		ansibleCmd = exec.Command("ansible-playbook", "-v", "-i", hostFilePath, playbookPath)
 	}
 
 	// Run the playbook
-	out, err := ansibleCmd.CombinedOutput()
-	return string(out), err
+	wsuOut, err := ansibleCmd.CombinedOutput()
+	return string(wsuOut), usedPinned, err
+}
+
+// testVM runs the WSU against the given VM and runs the e2e test suite against that VM as well
+func runTest(t *testing.T, pinnedWMCB bool, vm e2ef.WindowsVM, wsuOut string, wmcbURL string) {
+	// Run the test suite
+	runE2ETestSuite(t, pinnedWMCB, wmcbURL, vm, wsuOut)
+
+	// Run the test suite again, to ensure that the WSU can be run multiple times against the same VM
+	t.Run("Run the WSU against the same VM again", func(t *testing.T) {
+		runE2ETestSuite(t, pinnedWMCB, wmcbURL, vm, wsuOut)
+	})
 }
 
 // getAnsibleTempDirPath returns the path of the ansible temp directory on the remote VM
@@ -248,13 +268,13 @@ func getAnsibleTempDirPath(ansibleOutput string) (string, error) {
 }
 
 // runE2ETestSuite runs the WSU test suite against a VM
-func runE2ETestSuite(t *testing.T, pinnedWMCB bool, vm e2ef.WindowsVM, ansibleOutput string) {
+func runE2ETestSuite(t *testing.T, pinnedWMCB bool, wmcbURL string, vm e2ef.WindowsVM, ansibleOutput string) {
 	tempDirPath, err := getAnsibleTempDirPath(ansibleOutput)
 	require.NoError(t, err, "Could not get path of Ansible temp directory")
 
 	if pinnedWMCB {
 		t.Run("Using pinned version of WMCB", func(t *testing.T) {
-			testPinnedWMCB(t, ansibleOutput)
+			testPinnedWMCB(t, ansibleOutput, wmcbURL)
 		})
 	} else {
 		t.Run("Built WMCB", func(t *testing.T) {
