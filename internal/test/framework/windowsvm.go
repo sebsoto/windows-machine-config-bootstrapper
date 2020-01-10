@@ -20,7 +20,7 @@ const (
 	// command executed on the remote Windows VM
 	remotePowerShellCmdPrefix = "powershell.exe -NonInteractive -ExecutionPolicy Bypass "
 	// sshKey is the key that will be used to access created Windows VMs
-	sshKey = "libra"
+	sshKey = "openshift-dev"
 	// user for the Windows node created.
 	// TODO: remove this hardcoding to any user.
 	user = "Administrator"
